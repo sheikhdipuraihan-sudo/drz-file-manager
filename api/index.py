@@ -1908,5 +1908,7 @@ def _vercel_dispatch(_path):
     if _path == "logout" and request.method == "GET":
         session.clear()
         return redirect("/")
+    if not g.user and _path in {"account", "trash", "admin", "admin/logs", "admin/monitor", "admin/pin"}:
+        return redirect("/login?next=" + original_path)
     endpoint, values = app.url_map.bind_to_environ(request.environ).match()
     return app.view_functions[endpoint](**values)
