@@ -1893,3 +1893,20 @@ def security_headers(resp):
 
 if __name__ == '__main__':
     app.run(host=os.environ.get('HOST', '127.0.0.1'), port=int(os.environ.get('PORT', 5000)), debug=False)
+# Vercel route dispatcher
+_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+@app.route("/api/index", defaults={"_path": ""}, methods=_METHODS)
+@app.route("/api/index/", defaults={"_path": ""}, methods=_METHODS)
+@app.route("/api/index/<path:_path>", methods=_METHODS)
+def _vercel_dispatch(_path):
+    original_path = "/" + _path if _path else "/"
+    request.environ["ORIGINAL_PATH"] = original_path
+    request.environ["PATH_INFO"] = original_path
+    for key in ("path", "full_path", "url", "base_url", "path_url", "host_url"):
+        request.__dict__.pop(key, None)
+    if _path == "logout" and request.method == "GET":
+        session.clear()
+        return redirect("/")
+    endpoint, values = app.url_map.bind_to_environ(request.environ).match()
+    return app.view_functions[endpoint](**values)
