@@ -1,0 +1,1 @@
+{"routes":[{"path":"/","title":"DRZ File Manager"},{"path":"/login","title":"Login"},{"path":"/account","title":"Account"},{"path":"/trash","title":"Trash"},{"path":"/admin","title":"Admin"},{"path":"/admin/logs","title":"Audit Logs"},{"path":"/admin/monitor","title":"Monitor"},{"path":"/s/:token","title":"Shared File"}]}
