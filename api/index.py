@@ -311,7 +311,7 @@ def login_required(f):
     @wraps(f)
     def wrapper(*a, **kw):
         if not g.user:
-            return redirect('/login?next=' + request.environ.get('ORIGINAL_PATH', request.path))
+            return redirect('/login?next=' + (request.environ.get('ORIGINAL_PATH') or '/'))
         return f(*a, **kw)
     return wrapper
 
@@ -329,7 +329,7 @@ def pin_required(f):
     @admin_required
     def wrapper(*a, **kw):
         if time.time() - session.get('pin_ok_at', 0) > PIN_VALID_MINUTES * 60:
-            return redirect(url_for('admin_pin', next=request.path))
+            return redirect(url_for('admin_pin', next=(request.environ.get('ORIGINAL_PATH') or '/')))
         return f(*a, **kw)
     return wrapper
 
