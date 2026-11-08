@@ -2419,7 +2419,7 @@ FILES_BODY = r"""
 
 {% if show_upload %}
 <div class="card">
-  <div class="card-head"><h3>{{ icon('cloud-upload', 17) }} Upload files</h3><div class="spacer"></div><span class="hint">Max {{ max_upload_mb }} MB per request · stored on catbox.moe · files may be removed after 2 years of inactivity</span></div>
+  <div class="card-head"><h3>{{ icon('cloud-upload', 17) }} Upload files</h3><div class="spacer"></div></div>
   <div class="dropzone" id="dropZone">
     <div class="dz-ico">{{ icon('upload', 25) }}</div>
     <div class="dz-title">Drag &amp; drop files here</div>
@@ -2468,8 +2468,8 @@ FILES_BODY = r"""
       <a class="folder-ico" href="{{ url_for('index', folder=d['id']) }}">{{ icon('folder', 20) }}</a>
       <a class="grow" href="{{ url_for('index', folder=d['id']) }}"><b>{{ d['name'] }}</b><span>{{ d['count'] }} items · {{ d['size']|filesize }}</span></a>
       <div class="folder-actions">
-        <button type="button" title="Rename" onclick="renameFolder({{ d['id'] }}, {{ d['name']|tojson }})">{{ icon('edit', 14) }}</button>
-        <button type="button" title="Delete" onclick="deleteFolder({{ d['id'] }}, {{ d['name']|tojson }})">{{ icon('trash', 14) }}</button>
+        <button type="button" title="Rename" onclick="renameFolder({{ d['id'] }}, {{ d['name']|tojson|forceescape }})">{{ icon('edit', 14) }}</button>
+        <button type="button" title="Delete" onclick="deleteFolder({{ d['id'] }}, {{ d['name']|tojson|forceescape }})">{{ icon('trash', 14) }}</button>
       </div>
     </div>
     {% endfor %}
@@ -2480,20 +2480,20 @@ FILES_BODY = r"""
   <div id="fileArea" class="file-grid">
     {% for f in files %}
     {% set kind = file_kind(f['original_name']) %}
-    <div class="file-card" data-file-card="{{ f['id'] }}" oncontextmenu="showCtx(event, {{ f['id'] }}, {{ f['original_name']|tojson }}, '{{ kind }}')">
+    <div class="file-card" data-file-card="{{ f['id'] }}" oncontextmenu="showCtx(event, {{ f['id'] }}, {{ f['original_name']|tojson|forceescape }}, '{{ kind }}')">
       <label class="file-check"><input type="checkbox" data-select="{{ f['id'] }}" onchange="toggleSelect({{ f['id'] }}, this.checked)" aria-label="Select {{ f['original_name'] }}"></label>
       <button class="star-btn {% if f['is_starred'] %}on{% endif %}" type="button" onclick="starFile({{ f['id'] }}, this)" title="Star">{{ icon('star', 14) }}</button>
       {% if kind == 'image' %}
-        <img class="file-thumb" src="/preview/{{ f['id'] }}" alt="" loading="lazy" onclick="openPreview({{ f['id'] }}, {{ f['original_name']|tojson }}, 'image')">
+        <img class="file-thumb" src="/preview/{{ f['id'] }}" alt="" loading="lazy" onclick="openPreview({{ f['id'] }}, {{ f['original_name']|tojson|forceescape }}, 'image')">
       {% else %}
-        <div class="thumb-fallback" onclick="openPreview({{ f['id'] }}, {{ f['original_name']|tojson }}, '{{ kind }}')">{{ file_icon(f['original_name'], 38) }}</div>
+        <div class="thumb-fallback" onclick="openPreview({{ f['id'] }}, {{ f['original_name']|tojson|forceescape }}, '{{ kind }}')">{{ file_icon(f['original_name'], 38) }}</div>
       {% endif %}
       <div class="file-name" title="{{ f['original_name'] }}">{{ f['original_name'] }}</div>
       <div class="file-meta"><span>{{ f['file_size']|filesize }}</span><span class="dot-sep"></span><span data-rel="{{ f['upload_date'] }}">{{ f['upload_date'][:10] }}</span>{% if f['is_starred'] %}<span class="badge badge-stars">starred</span>{% endif %}</div>
       <div class="file-actions">
-        {% if can_preview(f['original_name']) %}<button class="btn ghost xs" type="button" onclick="openPreview({{ f['id'] }}, {{ f['original_name']|tojson }}, '{{ kind }}')">{{ icon('eye', 12) }} View</button>{% endif %}
+        {% if can_preview(f['original_name']) %}<button class="btn ghost xs" type="button" onclick="openPreview({{ f['id'] }}, {{ f['original_name']|tojson|forceescape }}, '{{ kind }}')">{{ icon('eye', 12) }} View</button>{% endif %}
         <a class="btn ghost xs" href="{{ url_for('download', file_id=f['id']) }}">{{ icon('download', 12) }} Save</a>
-        <button class="btn ghost xs" type="button" onclick="openShare({{ f['id'] }}, {{ f['original_name']|tojson }})" title="Share">{{ icon('share', 12) }}</button>
+        <button class="btn ghost xs" type="button" onclick="openShare({{ f['id'] }}, {{ f['original_name']|tojson|forceescape }})" title="Share">{{ icon('share', 12) }}</button>
         <button class="btn ghost xs" type="button" onclick="openDetails({{ f['id'] }})" title="Details">{{ icon('info', 12) }}</button>
       </div>
     </div>
@@ -4190,7 +4190,3 @@ def _vercel_dispatch(_path):
 if __name__ == '__main__':
     app.run(host=os.environ.get('HOST', '127.0.0.1'),
             port=int(os.environ.get('PORT', 5000)), debug=False)
-
-
-
-
