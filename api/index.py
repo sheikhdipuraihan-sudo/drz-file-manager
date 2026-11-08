@@ -55,6 +55,13 @@ CATBOX_MAX_BYTES = CATBOX_MAX_MB * 1024 * 1024
 CATBOX_BLOCKED_EXT = {'exe', 'scr', 'cpl', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
                       'jar', 'msi', 'bat', 'cmd', 'com', 'pif', 'vbs', 'ps1'}
 CATBOX_URL_PREFIX = 'https://files.catbox.moe/'
+CATBOX_URL_RE = re.compile(r'^https://files\.catbox\.moe/[A-Za-z0-9._-]{1,100}$')
+# Optional: browser uploads go to this CORS-enabled proxy (see cloudflare-worker/), which forwards
+# to catbox.moe. The server then only stores the returned URL, so Vercel's request-size limit
+# no longer applies. Leave empty to upload through the server as before.
+CATBOX_PROXY_URL = os.environ.get('CATBOX_PROXY_URL', '').strip()
+_proxy_parts = CATBOX_PROXY_URL.split('/')
+CATBOX_PROXY_ORIGIN = '/'.join(_proxy_parts[:3]) if CATBOX_PROXY_URL.startswith('https://') and len(_proxy_parts) >= 3 else ''
 
 SESSION_TIMEOUT = 30          # minutes
 PIN_VALID_MINUTES = 10
@@ -468,6 +475,9 @@ def get_csrf_token():
 
 
 app.jinja_env.globals['csrf_token'] = get_csrf_token
+app.jinja_env.globals['catbox_direct'] = lambda: STORAGE_BACKEND == 'catbox' and bool(CATBOX_PROXY_ORIGIN)
+app.jinja_env.globals['catbox_cfg'] = lambda: {'api': CATBOX_PROXY_URL, 'prefix': CATBOX_URL_PREFIX,
+                                               'max': CATBOX_MAX_BYTES, 'blocked': sorted(CATBOX_BLOCKED_EXT)}
 
 
 @app.before_request
@@ -1745,6 +1755,7 @@ window.__DRZ = {
   urls: {
     search: "{{ url_for('api_search') }}",
     upload: "{{ url_for('upload') }}",
+    register: "{{ url_for('upload_register') }}",
     index: "{{ url_for('index') }}",
     preview: "/preview/",
     download: "/download/",
@@ -1758,7 +1769,8 @@ window.__DRZ = {
     {id:'', name:'Home', depth:0}
     {% for f in all_folders %},{id:{{ f['id'] }}, name:{{ f['name']|tojson }}, depth:{{ f['depth'] }}}{% endfor %}
   ],
-  currentFolder: {{ (current_folder or 0)|tojson }}
+  currentFolder: {{ (current_folder or 0)|tojson }},
+  catbox: {% if catbox_direct() %}{{ catbox_cfg()|tojson }}{% else %}null{% endif %}
 };
 </script>
 <script>%%JS%%</script>
@@ -2179,39 +2191,97 @@ JS = r'''
       if(document.getElementById('dropZone')) uploadFiles(e.clipboardData.files);
     });
   }
-  function uploadFiles(files){
+  var directBroken = false;
+  function directEligible(file){
+    var c = D.catbox; if(!c || directBroken) return false;
+    if(file.size > c.max) return false;
+    var ext = (file.name.split('.').pop() || '').toLowerCase();
+    return c.blocked.indexOf(ext) < 0;
+  }
+  function catboxDirect(file, onProgress){
+    return new Promise(function(resolve, reject){
+      var fd = new FormData();
+      fd.append('reqtype', 'fileupload');
+      fd.append('fileToUpload', file, file.name);
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', D.catbox.api);
+      xhr.upload.onprogress = function(e){ if(e.lengthComputable) onProgress(e.loaded / e.total); };
+      xhr.onload = function(){
+        var t = (xhr.responseText || '').trim();
+        if(xhr.status === 200 && t.indexOf(D.catbox.prefix) === 0) resolve(t.split(/\s/)[0]);
+        else reject(new Error('upload proxy rejected the file'));
+      };
+      // proxy unreachable / blocked by CORS: stop using it this session and fall back to the server
+      xhr.onerror = function(){ directBroken = true; reject(new Error('upload proxy unreachable')); };
+      xhr.send(fd);
+    });
+  }
+  function registerRemote(file, url){
+    return fetch(D.urls.register, {
+      method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'application/json', 'X-CSRF-Token': D.csrf},
+      body: JSON.stringify({url:url, name:file.name, size:file.size, mime:file.type || '', folder_id: D.currentFolder || null})
+    }).then(function(r){
+      if(r.ok) return r.json();
+      return r.json().catch(function(){ return {}; }).then(function(j){
+        var e = new Error(j.error || ('HTTP ' + r.status)); e.reg = true; throw e;
+      });
+    });
+  }
+  function serverUpload(files, onProgress, cb){
     var fd = new FormData();
     for(var i=0;i<files.length;i++) fd.append('files', files[i]);
     fd.append('_csrf_token', D.csrf);
     fd.append('folder_id', D.currentFolder || '');
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', D.urls.upload);
+    xhr.upload.onprogress = function(e){ if(e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.onload = function(){ cb(xhr.status >= 200 && xhr.status < 400, xhr.status); };
+    xhr.onerror = function(){ cb(false, 0); };
+    xhr.send(fd);
+  }
+  function uploadFiles(files){
+    files = Array.prototype.slice.call(files);
+    var n = files.length, done = 0, errors = [], viaServer = [];
     var wrap = document.getElementById('uploadProgressWrap');
     var bar = document.getElementById('uploadProgress');
     var st = document.getElementById('uploadStatus');
     if(wrap) wrap.classList.add('show');
-    if(bar) bar.style.width = '0%';
-    if(st) st.textContent = 'Uploading ' + files.length + ' file(s)…';
-    var xhr = new XMLHttpRequest();
-    xhr.open('POST', D.urls.upload);
-    xhr.upload.onprogress = function(e){
-      if(e.lengthComputable && bar){
-        var pct = Math.round(e.loaded / e.total * 100);
-        bar.style.width = pct + '%';
-        if(st) st.textContent = 'Uploading… ' + pct + '%';
-      }
-    };
-    xhr.onload = function(){
-      if(xhr.status >= 200 && xhr.status < 400){
-        if(st) st.textContent = 'Upload complete. Refreshing…';
-        if(bar) bar.style.width = '100%';
-        toast(files.length + ' file(s) uploaded', 'success');
+    function setBar(frac, text){
+      if(bar) bar.style.width = Math.round(Math.min(1, frac) * 100) + '%';
+      if(st && text) st.textContent = text;
+    }
+    setBar(0, 'Uploading ' + n + ' file(s)…');
+    var chain = Promise.resolve();
+    files.forEach(function(f, i){
+      chain = chain.then(function(){
+        if(!directEligible(f)){ viaServer.push(f); return; }
+        return catboxDirect(f, function(p){ setBar((done + p) / n, 'Uploading ' + (i+1) + '/' + n + ': ' + f.name); })
+          .then(function(url){ return registerRemote(f, url); })
+          .then(function(){ done++; setBar(done / n); })
+          .catch(function(err){
+            if(err && err.reg){ errors.push(f.name + ': ' + err.message); }
+            else { viaServer.push(f); }
+          });
+      });
+    });
+    chain.then(function(){
+      if(!viaServer.length) return finish();
+      setBar(done / n, 'Uploading ' + viaServer.length + ' file(s) via server…');
+      serverUpload(viaServer, function(p){ setBar((done + p * viaServer.length) / n); }, function(ok, status){
+        if(ok) done += viaServer.length;
+        else errors.push(status === 413 ? 'File too large for this host.' : 'Server upload failed' + (status ? ' (' + status + ')' : '') + '.');
+        finish();
+      });
+    });
+    function finish(){
+      if(errors.length) toast(errors[0], 'error');
+      if(done > 0){
+        setBar(1, 'Upload complete. Refreshing…');
+        toast(done + ' file(s) uploaded', 'success');
         setTimeout(function(){ location.href = location.pathname + (location.search || ''); }, 500);
-      } else {
-        if(st) st.textContent = 'Upload failed (' + xhr.status + ').';
-        toast('Upload failed. Check file size and quota.', 'error');
-      }
-    };
-    xhr.onerror = function(){ if(st) st.textContent = 'Network error.'; toast('Upload failed', 'error'); };
-    xhr.send(fd);
+      } else if(st){ st.textContent = 'Upload failed.'; }
+    }
   }
 
   /* ---------- view toggle / password ---------- */
@@ -3138,6 +3208,46 @@ def upload():
     if folder_id:
         return redirect(url_for('index', folder=folder_id))
     return redirect(url_for('index'))
+
+
+@app.route('/upload/register', methods=['POST'])
+@login_required
+def upload_register():
+    """Record a file the browser already uploaded to catbox.moe (via the proxy)."""
+    if STORAGE_BACKEND != 'catbox':
+        return jsonify(error='Direct uploads are disabled.'), 400
+    data = request.get_json(silent=True) or {}
+    url = str(data.get('url') or '').strip()
+    if not CATBOX_URL_RE.match(url):
+        return jsonify(error='Invalid file URL.'), 400
+    orig = clean_filename(str(data.get('name') or ''))
+    if not orig:
+        return jsonify(error='Invalid file name.'), 400
+    if ext_of(orig) in CATBOX_BLOCKED_EXT:
+        return jsonify(error='This file type is not allowed.'), 400
+    try:
+        size = int(data.get('size') or 0)
+    except (TypeError, ValueError):
+        return jsonify(error='Invalid file size.'), 400
+    if size < 0 or size > CATBOX_MAX_BYTES:
+        return jsonify(error='Invalid file size.'), 400
+    try:
+        folder_id = int(data.get('folder_id') or 0) or None
+    except (TypeError, ValueError):
+        return jsonify(error='Invalid folder.'), 400
+    if folder_id:
+        get_folder_or_404(folder_id)
+    quota = quota_bytes(g.user)
+    if quota and used_bytes(g.user['id']) + size > quota:
+        return jsonify(error='Storage quota exceeded.'), 413
+    mime = str(data.get('mime') or '')[:100] or mimetypes.guess_type(orig)[0] or ''
+    cur = get_db().execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, "
+                           "upload_date, updated_at, remote_url) VALUES (?,?,?,?,?,?,?,?,?)",
+                           (g.user['id'], folder_id, stored_name_for(orig), orig, size, mime,
+                            now_str(), now_str(), url))
+    get_db().commit()
+    audit('upload', 'ok', '1 file(s), via catbox proxy')
+    return jsonify(ok=True, id=cur.lastrowid)
 
 
 @app.route('/download/<int:file_id>')
@@ -4155,7 +4265,7 @@ def security_headers(resp):
                             "media-src 'self' blob: https://files.catbox.moe; "
                             "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
                             "frame-src 'self' https://files.catbox.moe; object-src 'none'; base-uri 'self'; "
-                            "form-action 'self'; connect-src 'self' https://files.catbox.moe")
+                            "form-action 'self'; connect-src 'self' https://files.catbox.moe " + CATBOX_PROXY_ORIGIN)
     if request.is_secure:
         resp.headers.setdefault('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
     if resp.mimetype == 'text/html':
