@@ -186,5 +186,27 @@ btns = re.findall(r'onclick="((?:openPreview|openShare)\([^"]*)"', page)
 check('view/share buttons rendered', len(btns) > 0, str(len(btns)))
 check('view/share onclick not broken by raw quotes', all('&#34;' in b for b in btns))
 
+# direct-to-catbox registration endpoint (browser uploads via proxy, server stores the URL)
+index.STORAGE_BACKEND = 'catbox'
+page = c.get('/').data.decode(); tok = csrf(page)
+H = {'X-CSRF-Token': tok}
+good = {'url': 'https://files.catbox.moe/abc123.png', 'name': 'direct pic.png', 'size': 1234, 'mime': 'image/png', 'folder_id': None}
+r = c.post('/upload/register', json=good, headers=H)
+check('register ok', r.status_code == 200 and r.get_json().get('ok'), str(r.status_code))
+check('registered file listed', b'direct pic.png' in c.get('/').data)
+r = c.post('/upload/register', json=dict(good, url='https://evil.example/x.png'), headers=H)
+check('register rejects foreign url', r.status_code == 400)
+r = c.post('/upload/register', json=dict(good, url='https://files.catbox.moe/a/../b.png'), headers=H)
+check('register rejects odd url', r.status_code == 400)
+r = c.post('/upload/register', json=dict(good, name='run.exe'), headers=H)
+check('register rejects blocked ext', r.status_code == 400)
+r = c.post('/upload/register', json=dict(good, folder_id=99999), headers=H)
+check('register rejects foreign folder', r.status_code == 404)
+r = c.post('/upload/register', json=good)
+check('register needs csrf', r.status_code == 400)
+index.STORAGE_BACKEND = 'local'
+r = c.post('/upload/register', json=good, headers=H)
+check('register off when storage is local', r.status_code == 400)
+
 print('ALL TESTS PASSED')
 shutil.rmtree(tmp, ignore_errors=True)
