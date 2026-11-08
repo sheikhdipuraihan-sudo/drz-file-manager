@@ -2,6 +2,7 @@ import os, re, io, sys, tempfile, json, shutil
 tmp = tempfile.mkdtemp(prefix='drz-test-')
 os.environ['DRZ_DATA_DIR'] = tmp
 os.environ['SECRET_KEY'] = 'test-secret'
+os.environ['DRZ_STORAGE'] = 'local'
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'api'))
 import index
 
@@ -141,6 +142,32 @@ check('trash row', t is not None)
 html = c.get('/trash').data.decode(); tok = csrf(html)
 r = c.post('/trash/restore/%d' % t['id'], data={'_csrf_token': tok}, follow_redirects=True)
 check('restore', r.status_code == 200 and b'Restored' in r.data)
+
+# remote (catbox-backed) file behaviour
+db.execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, upload_date, updated_at, remote_url) "
+           "VALUES (1, NULL, 'remote_test.txt', 'remote.txt', 5, 'text/plain', ?, ?, 'https://files.catbox.moe/abc123.txt')",
+           (index.now_str(), index.now_str()))
+db.commit()
+rf = db.execute("SELECT * FROM files WHERE original_name='remote.txt'").fetchone()
+check('remote row', rf is not None and rf['remote_url'].startswith('https://files.catbox.moe/'))
+r = c.get('/download/%d' % rf['id'])
+check('remote download redirect', r.status_code == 302 and b'files.catbox.moe' in r.headers['Location'].encode())
+r = c.get('/preview/%d' % rf['id'])
+check('remote preview redirect', r.status_code == 302 and b'files.catbox.moe' in r.headers['Location'].encode())
+html = c.get('/').data.decode(); tok = csrf(html)
+r = c.post('/share/%d' % rf['id'], data={'_csrf_token': tok, 'hours': '24', 'max_downloads': '0',
+                                        'password': '', 'note': '', 'allow_preview': '1'}, follow_redirects=True)
+rs = db.execute("SELECT * FROM share_links WHERE file_id=?", (rf['id'],)).fetchone()
+check('remote share create', r.status_code == 200 and rs is not None)
+r = c.get('/s/%s/download' % rs['token'])
+check('remote share redirect', r.status_code == 302 and b'files.catbox.moe' in r.headers['Location'].encode())
+r = c.post('/delete/%d' % rf['id'], data={'_csrf_token': tok}, follow_redirects=True)
+rt = db.execute("SELECT * FROM trash WHERE original_name='remote.txt'").fetchone()
+check('remote trash keeps url', rt is not None and rt['remote_url'].startswith('https://files.catbox.moe/'))
+html = c.get('/trash').data.decode(); tok = csrf(html)
+r = c.post('/trash/restore/%d' % rt['id'], data={'_csrf_token': tok}, follow_redirects=True)
+rr = db.execute("SELECT * FROM files WHERE original_name='remote.txt'").fetchone()
+check('remote restore keeps url', r.status_code == 200 and rr is not None and rr['remote_url'].startswith('https://files.catbox.moe/'))
 
 # assets
 for path, needle in [('/favicon.svg', b'<svg'), ('/manifest.webmanifest', b'DRZ'), ('/robots.txt', b'Disallow'),

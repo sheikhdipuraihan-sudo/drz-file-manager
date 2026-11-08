@@ -26,6 +26,10 @@ from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from markupsafe import Markup
+try:
+    import requests
+except ImportError:  # pragma: no cover - optional at runtime
+    requests = None
 
 # ============================================================
 # Configuration
@@ -41,6 +45,16 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('FORCE_HTTPS_COOKIES', '0') == '1'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
+
+# Storage backend: 'catbox' uploads to catbox.moe and keeps only the URL,
+# 'local' keeps files on disk. Falls back to local automatically if catbox fails.
+STORAGE_BACKEND = os.environ.get('DRZ_STORAGE', 'catbox').strip().lower()
+CATBOX_API = os.environ.get('CATBOX_API', 'https://catbox.moe/user/api.php')
+CATBOX_MAX_MB = int(os.environ.get('CATBOX_MAX_MB', '200'))
+CATBOX_MAX_BYTES = CATBOX_MAX_MB * 1024 * 1024
+CATBOX_BLOCKED_EXT = {'exe', 'scr', 'cpl', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+                      'jar', 'msi', 'bat', 'cmd', 'com', 'pif', 'vbs', 'ps1'}
+CATBOX_URL_PREFIX = 'https://files.catbox.moe/'
 
 SESSION_TIMEOUT = 30          # minutes
 PIN_VALID_MINUTES = 10
@@ -351,6 +365,7 @@ def init_db():
                 updated_at TIMESTAMP,
                 is_starred INTEGER DEFAULT 0,
                 download_count INTEGER DEFAULT 0,
+                remote_url TEXT DEFAULT '',
                 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS trash (
@@ -363,6 +378,7 @@ def init_db():
                 deleted_by INTEGER NOT NULL,
                 original_name TEXT,
                 file_size INTEGER DEFAULT 0,
+                remote_url TEXT DEFAULT '',
                 deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (deleted_by) REFERENCES users (id)
             );
@@ -400,8 +416,9 @@ def init_db():
                       ('theme', "TEXT DEFAULT 'system'"), ('accent', "TEXT DEFAULT 'indigo'")],
             'files': [('folder_id', 'INTEGER'), ('mime', "TEXT DEFAULT ''"),
                       ('updated_at', 'TIMESTAMP'), ('is_starred', 'INTEGER DEFAULT 0'),
-                      ('download_count', 'INTEGER DEFAULT 0')],
-            'trash': [('stored_name', 'TEXT'), ('folder_name', 'TEXT'), ('mime', "TEXT DEFAULT ''")],
+                      ('download_count', 'INTEGER DEFAULT 0'), ('remote_url', "TEXT DEFAULT ''")],
+            'trash': [('stored_name', 'TEXT'), ('folder_name', 'TEXT'), ('mime', "TEXT DEFAULT ''"),
+                      ('remote_url', "TEXT DEFAULT ''")],
             'share_links': [('password_hash', "TEXT DEFAULT ''"), ('max_downloads', 'INTEGER DEFAULT 0'),
                             ('download_count', 'INTEGER DEFAULT 0'), ('allow_preview', 'INTEGER DEFAULT 1'),
                             ('note', "TEXT DEFAULT ''")],
@@ -689,6 +706,40 @@ def trash_physical_path(t):
     return os.path.join(get_trash_dir(t['user_id']), name)
 
 
+def row_get(row, key, default=''):
+    try:
+        return row[key] if row[key] is not None else default
+    except (IndexError, KeyError):
+        return default
+
+
+def catbox_upload(file_storage, orig, size):
+    """Upload a FileStorage to catbox.moe. Returns a public URL or None."""
+    if STORAGE_BACKEND != 'catbox' or requests is None:
+        return None
+    if size > CATBOX_MAX_BYTES:
+        return None
+    if ext_of(orig) in CATBOX_BLOCKED_EXT:
+        return None
+    try:
+        file_storage.stream.seek(0)
+        resp = requests.post(
+            CATBOX_API,
+            data={'reqtype': 'fileupload'},
+            files={'fileToUpload': (orig, file_storage.stream,
+                                    file_storage.mimetype or 'application/octet-stream')},
+            timeout=180,
+            headers={'User-Agent': 'DRZ-File-Manager/1.0'})
+        text = (resp.text or '').strip()
+        if resp.status_code == 200 and text.startswith(CATBOX_URL_PREFIX):
+            return text.split()[0]
+        app.logger.warning('catbox upload failed (%s): %s', resp.status_code, text[:160])
+    except Exception as exc:  # network/API failures fall back to local storage
+        app.logger.warning('catbox upload error: %s', exc)
+    return None
+
+
+
 def unique_trash_name(user_id, name):
     path = os.path.join(get_trash_dir(user_id), name)
     if not os.path.exists(path):
@@ -718,15 +769,16 @@ def purge_expired_trash():
 
 def move_file_to_trash(file_row, folder_name=''):
     name = unique_trash_name(file_row['user_id'], file_row['filename'])
+    remote = row_get(file_row, 'remote_url')
     src = physical_path(file_row)
     dst = os.path.join(get_trash_dir(file_row['user_id']), name)
-    if os.path.isfile(src):
+    if not remote and os.path.isfile(src):
         shutil.move(src, dst)
     db = get_db()
     db.execute("INSERT INTO trash (user_id, original_path, stored_name, folder_name, mime, deleted_by, "
-               "original_name, file_size, deleted_at) VALUES (?,?,?,?,?,?,?,?,?)",
+               "original_name, file_size, remote_url, deleted_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                (file_row['user_id'], file_row['filename'], name, folder_name, file_row['mime'] or '',
-                g.user['id'], file_row['original_name'], file_row['file_size'], now_str()))
+                g.user['id'], file_row['original_name'], file_row['file_size'], remote, now_str()))
     db.execute("DELETE FROM files WHERE id=?", (file_row['id'],))
     db.commit()
     return name
@@ -2220,6 +2272,7 @@ def inject_globals():
         'app_name': app_name(), 'theme': 'system', 'accent': 'indigo',
         'trash_count': 0, 'share_count': 0, 'storage_used': 0, 'storage_quota': 0,
         'storage_pct': 0, 'file_count': 0, 'all_folders': [], 'current_folder': 0,
+        'storage_backend': STORAGE_BACKEND,
     }
     if getattr(g, 'user', None):
         try:
@@ -2366,7 +2419,7 @@ FILES_BODY = r"""
 
 {% if show_upload %}
 <div class="card">
-  <div class="card-head"><h3>{{ icon('cloud-upload', 17) }} Upload files</h3><div class="spacer"></div><span class="hint">Max {{ max_upload_mb }} MB per request</span></div>
+  <div class="card-head"><h3>{{ icon('cloud-upload', 17) }} Upload files</h3><div class="spacer"></div><span class="hint">Max {{ max_upload_mb }} MB per request · stored on catbox.moe · files may be removed after 2 years of inactivity</span></div>
   <div class="dropzone" id="dropZone">
     <div class="dz-ico">{{ icon('upload', 25) }}</div>
     <div class="dz-title">Drag &amp; drop files here</div>
@@ -2375,6 +2428,7 @@ FILES_BODY = r"""
   </div>
   <div class="progress-wrap" id="uploadProgressWrap"><div class="progress-bar" id="uploadProgress"></div></div>
   <div id="uploadStatus" class="hint" style="margin-top:8px"></div>
+  {% if storage_backend == 'catbox' %}<div class="hint" style="margin-top:8px">{{ icon('info', 13) }} Files are hosted on catbox.moe and may be removed after 2 years of inactivity.</div>{% endif %}
 </div>
 {% endif %}
 
@@ -3045,26 +3099,38 @@ def upload():
         if not orig:
             skipped += 1
             continue
-        stored = stored_name_for(orig)
-        path = os.path.join(folder, stored)
         try:
-            f.save(path)
-            size = os.path.getsize(path)
-        except OSError:
-            skipped += 1
-            continue
+            f.stream.seek(0, os.SEEK_END)
+            size = f.stream.tell()
+            f.stream.seek(0)
+        except (OSError, AttributeError):
+            size = 0
         if quota and used + size > quota:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
             flash("Storage quota exceeded. Some files were not uploaded.", "err")
             break
+        remote_url = catbox_upload(f, orig, size) or ''
+        stored = stored_name_for(orig)
+        if not remote_url:
+            path = os.path.join(folder, stored)
+            try:
+                f.stream.seek(0)
+                f.save(path)
+                size = os.path.getsize(path)
+            except OSError:
+                skipped += 1
+                continue
+            if quota and used + size > quota:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                flash("Storage quota exceeded. Some files were not uploaded.", "err")
+                break
         used += size
         mime = f.mimetype or mimetypes.guess_type(orig)[0] or ''
-        get_db().execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, upload_date, updated_at) "
-                         "VALUES (?,?,?,?,?,?,?,?)",
-                         (g.user['id'], folder_id, stored, orig, size, mime, now_str(), now_str()))
+        get_db().execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, "
+                         "upload_date, updated_at, remote_url) VALUES (?,?,?,?,?,?,?,?,?)",
+                         (g.user['id'], folder_id, stored, orig, size, mime, now_str(), now_str(), remote_url))
         saved += 1
     get_db().commit()
     audit('upload', 'ok' if saved else 'fail', f'{saved} file(s), {skipped} skipped')
@@ -3078,12 +3144,15 @@ def upload():
 @login_required
 def download(file_id):
     f = own_file_or_404(file_id)
+    remote = row_get(f, 'remote_url')
     path = physical_path(f)
-    if not os.path.isfile(path):
+    if not remote and not os.path.isfile(path):
         abort(404)
     get_db().execute("UPDATE files SET download_count=download_count+1 WHERE id=?", (file_id,))
     get_db().commit()
     audit('download', 'ok', f['original_name'])
+    if remote:
+        return redirect(remote)
     return send_file(path, as_attachment=True, download_name=f['original_name'])
 
 
@@ -3091,9 +3160,12 @@ def download(file_id):
 @login_required
 def preview(file_id):
     f = own_file_or_404(file_id)
+    remote = row_get(f, 'remote_url')
     path = physical_path(f)
-    if not os.path.isfile(path):
+    if not remote and not os.path.isfile(path):
         abort(404)
+    if remote:
+        return redirect(remote)
     mime = f['mime'] or mimetypes.guess_type(f['original_name'])[0] or 'application/octet-stream'
     if is_text(f['original_name']):
         mime = 'text/plain; charset=utf-8'
@@ -3141,17 +3213,23 @@ def star_file(file_id):
 @login_required
 def copy_file(file_id):
     f = own_file_or_404(file_id)
-    src = physical_path(f)
-    if not os.path.isfile(src):
-        abort(404)
+    remote = row_get(f, 'remote_url')
     stored = stored_name_for(f['original_name'])
-    dst = os.path.join(get_user_dir(g.user['id']), stored)
-    shutil.copy2(src, dst)
+    size = f['file_size']
+    if remote:
+        pass
+    else:
+        src = physical_path(f)
+        if not os.path.isfile(src):
+            abort(404)
+        dst = os.path.join(get_user_dir(g.user['id']), stored)
+        shutil.copy2(src, dst)
+        size = os.path.getsize(dst)
     db = get_db()
-    db.execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, upload_date, updated_at) "
-               "VALUES (?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, "
+               "upload_date, updated_at, remote_url) VALUES (?,?,?,?,?,?,?,?,?)",
                (g.user['id'], f['folder_id'], stored, 'Copy of ' + f['original_name'],
-                os.path.getsize(dst), f['mime'], now_str(), now_str()))
+                size, f['mime'], now_str(), now_str(), remote))
     db.commit()
     audit('copy', 'ok', f['original_name'])
     flash("File duplicated.", "ok")
@@ -3200,7 +3278,8 @@ def bulk():
             used_names = set()
             for f in rows:
                 p = physical_path(f)
-                if not os.path.isfile(p):
+                remote = row_get(f, 'remote_url')
+                if not remote and not os.path.isfile(p):
                     continue
                 name = f['original_name'] or f['filename']
                 base, dot, ext = name.rpartition('.')
@@ -3210,7 +3289,16 @@ def bulk():
                     candidate = f"{base} ({n}).{ext}" if dot else f"{name} ({n})"
                     n += 1
                 used_names.add(candidate)
-                zf.write(p, candidate)
+                if remote:
+                    try:
+                        rr = requests.get(remote, timeout=120) if requests else None
+                        if rr is None or not rr.ok:
+                            continue
+                        zf.writestr(candidate, rr.content)
+                    except Exception:
+                        continue
+                else:
+                    zf.write(p, candidate)
         buf.seek(0)
         audit('bulk_download', 'ok', f'{len(rows)} file(s)')
         return send_file(buf, mimetype='application/zip', as_attachment=True, download_name='drz-files.zip')
@@ -3294,19 +3382,22 @@ def trash_view():
 def restore(trash_id):
     t = own_trash_or_404(trash_id)
     src = trash_physical_path(t)
+    remote = row_get(t, 'remote_url')
     dst_name = t['stored_name'] or t['original_path']
     dst = os.path.join(get_user_dir(g.user['id']), dst_name)
     if os.path.exists(dst):
         dst_name = stored_name_for(t['original_name'] or 'file')
         dst = os.path.join(get_user_dir(g.user['id']), dst_name)
-    if not os.path.isfile(src):
+    if not remote and not os.path.isfile(src):
         flash("File data is missing; removing the entry.", "err")
     else:
-        shutil.move(src, dst)
-        get_db().execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, upload_date, updated_at) "
-                         "VALUES (?,?,?,?,?,?,?,?)",
+        if not remote:
+            shutil.move(src, dst)
+        get_db().execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, "
+                         "upload_date, updated_at, remote_url) VALUES (?,?,?,?,?,?,?,?,?)",
                          (g.user['id'], None, dst_name, t['original_name'], t['file_size'],
-                          t['mime'] or mimetypes.guess_type(t['original_name'] or '')[0] or '', now_str(), now_str()))
+                          t['mime'] or mimetypes.guess_type(t['original_name'] or '')[0] or '',
+                          now_str(), now_str(), remote))
         audit('restore', 'ok', t['original_name'])
         flash("Restored to Home.", "ok")
     get_db().execute("DELETE FROM trash WHERE id=?", (trash_id,))
@@ -3319,11 +3410,12 @@ def restore(trash_id):
 def purge(trash_id):
     t = own_trash_or_404(trash_id)
     p = trash_physical_path(t)
-    try:
-        if os.path.isfile(p):
-            os.remove(p)
-    except OSError:
-        pass
+    if not row_get(t, 'remote_url'):
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
     get_db().execute("DELETE FROM trash WHERE id=?", (trash_id,))
     get_db().commit()
     audit('purge', 'ok', t['original_name'])
@@ -3336,6 +3428,8 @@ def purge(trash_id):
 def trash_empty():
     rows = get_db().execute("SELECT * FROM trash WHERE user_id=?", (g.user['id'],)).fetchall()
     for t in rows:
+        if row_get(t, 'remote_url'):
+            continue
         try:
             p = trash_physical_path(t)
             if os.path.isfile(p):
@@ -3356,18 +3450,20 @@ def trash_restore_all():
     restored = 0
     for t in rows:
         src = trash_physical_path(t)
-        if not os.path.isfile(src):
+        remote = row_get(t, 'remote_url')
+        if not remote and not os.path.isfile(src):
             continue
         dst_name = t['stored_name'] or t['original_path']
         dst = os.path.join(get_user_dir(g.user['id']), dst_name)
         if os.path.exists(dst):
             dst_name = stored_name_for(t['original_name'] or 'file')
             dst = os.path.join(get_user_dir(g.user['id']), dst_name)
-        shutil.move(src, dst)
-        get_db().execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, upload_date, updated_at) "
-                         "VALUES (?,?,?,?,?,?,?,?)",
+        if not remote:
+            shutil.move(src, dst)
+        get_db().execute("INSERT INTO files (user_id, folder_id, filename, original_name, file_size, mime, "
+                         "upload_date, updated_at, remote_url) VALUES (?,?,?,?,?,?,?,?,?)",
                          (g.user['id'], None, dst_name, t['original_name'], t['file_size'],
-                          t['mime'] or '', now_str(), now_str()))
+                          t['mime'] or '', now_str(), now_str(), remote))
         restored += 1
     get_db().execute("DELETE FROM trash WHERE user_id=?", (g.user['id'],))
     get_db().commit()
@@ -3435,7 +3531,7 @@ def revoke_share(link_id):
 
 def _share_row(token):
     return get_db().execute(
-        "SELECT s.*, f.filename, f.original_name, f.file_size, f.user_id AS owner_id, u.username "
+        "SELECT s.*, f.filename, f.original_name, f.file_size, f.remote_url, f.user_id AS owner_id, u.username "
         "FROM share_links s JOIN files f ON f.id=s.file_id JOIN users u ON u.id=s.created_by "
         "WHERE s.token=?", (token,)).fetchone()
 
@@ -3485,11 +3581,14 @@ def shared_download(token):
     if row['password_hash'] and not session.get('share_ok_' + str(row['id'])):
         return redirect(url_for('shared', token=token))
     path = os.path.join(get_user_dir(row['owner_id']), row['filename'])
-    if not os.path.isfile(path):
+    remote = row_get(row, 'remote_url')
+    if not remote and not os.path.isfile(path):
         abort(404)
     get_db().execute("UPDATE share_links SET download_count=download_count+1 WHERE id=?", (row['id'],))
     get_db().commit()
     audit('share_download', 'ok', row['original_name'], 'anonymous')
+    if remote:
+        return redirect(remote)
     return send_file(path, as_attachment=True, download_name=row['original_name'])
 
 
@@ -3501,6 +3600,9 @@ def shared_raw(token):
         abort(404)
     if row['password_hash'] and not session.get('share_ok_' + str(row['id'])):
         abort(403)
+    remote = row_get(row, 'remote_url')
+    if remote:
+        return redirect(remote)
     path = os.path.join(get_user_dir(row['owner_id']), row['filename'])
     if not os.path.isfile(path):
         abort(404)
@@ -4049,10 +4151,11 @@ def security_headers(resp):
     resp.headers.setdefault('X-XSS-Protection', '1; mode=block')
     resp.headers.setdefault('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
     resp.headers.setdefault('Content-Security-Policy',
-                            "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
+                            "default-src 'self'; img-src 'self' data: blob: https://files.catbox.moe; "
+                            "media-src 'self' blob: https://files.catbox.moe; "
                             "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
-                            "frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; "
-                            "connect-src 'self'")
+                            "frame-src 'self' https://files.catbox.moe; object-src 'none'; base-uri 'self'; "
+                            "form-action 'self'; connect-src 'self' https://files.catbox.moe")
     if request.is_secure:
         resp.headers.setdefault('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
     if resp.mimetype == 'text/html':
