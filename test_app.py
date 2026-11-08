@@ -179,5 +179,12 @@ for path, needle in [('/favicon.svg', b'<svg'), ('/manifest.webmanifest', b'DRZ'
 r = c.get('/nope')
 check('404 page', r.status_code == 404 and b'Not found' in r.data)
 
+# regression: View/Share onclick handlers must stay valid HTML (JSON args need escaped quotes)
+r = c.get('/')
+page = r.data.decode()
+btns = re.findall(r'onclick="((?:openPreview|openShare)\([^"]*)"', page)
+check('view/share buttons rendered', len(btns) > 0, str(len(btns)))
+check('view/share onclick not broken by raw quotes', all('&#34;' in b for b in btns))
+
 print('ALL TESTS PASSED')
 shutil.rmtree(tmp, ignore_errors=True)
